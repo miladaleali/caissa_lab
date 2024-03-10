@@ -3,6 +3,7 @@ from typing import Literal
 from datetime import datetime, date
 import asyncio
 import os
+from tqdm import tqdm
 
 import pandas as pd
 from ccxt.async_support import okx, Exchange
@@ -96,7 +97,7 @@ async def fetch_data(
     sinces = list(chunkit(sinces, api_limit[0]))
 
     datas = []
-    for _sinces in sinces:
+    for _sinces in tqdm(sinces, total=len(sinces), unit='batch', desc='Downloading OHLCV...'):
         _tmp = await asyncio.gather(*[_fetch_ohlcv(data_provider=data_provider, symbol=symbol, timeframe=timeframe, since=since, limit=limit) for since in _sinces])
         _tmp = [d for sub_d in _tmp for d in sub_d]
         datas.extend(_tmp)

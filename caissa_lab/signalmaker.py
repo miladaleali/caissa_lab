@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from pydantic import BaseModel
 import pandas_ta as pdt
+from tqdm import tqdm
 
 
 from caissa_lab.quantifier import QuantifyCalculator
@@ -28,15 +29,9 @@ class Order(BaseModel):
     def pnl_impact(self) -> float:
         return self.price * self.amount
 
-class Orders:
-    def __init__(
-        self,
-        signal: pd.Series,
-        analysis_quality: pd.Series,
-        long: bool,
-    ) -> None:
+class BaseOrders:
+    def __init__(self, signal: pd.Series, long: bool) -> None:
         self.signal = signal
-        self.analysis_quality = analysis_quality
         self.long = long
         self.remain_portion = 1
         self.tp_remain = 1
@@ -44,6 +39,56 @@ class Orders:
         self.orders: list[Order] = []
         self.done_orders: list[Order] = []
         self.exit_price = 0
+
+    def make_orders(self) -> None:
+        raise NotImplementedError
+
+    def update_orders(self, done_orders: list) -> None:
+        for order in done_orders:
+            self.orders.remove(order)
+            self.done_orders.append(order)
+
+    def is_order_filled(self, order: Order, ohlcv: pd.Series, long: bool) -> bool:
+        price = order.price
+        if (price in np.arange(ohlcv.low, ohlcv.high)) or (price == ohlcv.high):
+            return True
+        elif order.type == 'sl':
+            if long and price > ohlcv.open:
+                order.price = ohlcv.open
+                return True
+            elif not long and price < ohlcv.open:
+                order.price = ohlcv.open
+                return True
+        elif order.type == 'tp':
+            if long and price < ohlcv.open:
+                order.price = ohlcv.open
+                return True
+            elif not long and price > ohlcv.open:
+                order.price = ohlcv.open
+                return True
+        return False
+
+    def order_filled(self, order: Order) -> None:
+        if order.type == 'tp':
+            adjust_amount = order.amount * (self.remain_portion/self.tp_remain)
+            self.exit_price += order.price * adjust_amount
+            self.tp_remain -= order.amount
+        else:
+            adjust_amount = order.amount * (self.remain_portion/self.sl_remain)
+            self.exit_price += order.price * (adjust_amount)
+            self.sl_remain -= order.amount
+        
+        self.remain_portion -= adjust_amount
+
+class Orders(BaseOrders):
+    def __init__(
+        self,
+        signal: pd.Series,
+        long: bool,
+        analysis_quality: pd.Series,
+    ) -> None:
+        super().__init__(signal, long)
+        self.analysis_quality = analysis_quality
 
     def make_orders(self) -> None:
         up, down = self.analysis_quality.get(['mean_rise', 'rise_std']), self.analysis_quality.get(['mean_fall', 'fall_std'])
@@ -117,42 +162,30 @@ class Orders:
             )
         )
 
-    def update_orders(self, done_orders: list) -> None:
-        for order in done_orders:
-            self.orders.remove(order)
-            self.done_orders.append(order)
+class StaticOrders(BaseOrders):
+    def __init__(self, signal: pd.Series, long: bool, tp_pct: float, sl_pct: float) -> None:
+        super().__init__(signal, long)
+        self.tp_pct = tp_pct/100
+        self.sl_pct = sl_pct/100
 
-    def is_order_filled(self, order: Order, ohlcv: pd.Series, long: bool) -> bool:
-        price = order.price
-        if (price in np.arange(ohlcv.low, ohlcv.high)) or (price == ohlcv.high):
-            return True
-        elif order.type == 'sl':
-            if long and price > ohlcv.open:
-                order.price = ohlcv.open
-                return True
-            elif not long and price < ohlcv.open:
-                order.price = ohlcv.open
-                return True
-        elif order.type == 'tp':
-            if long and price < ohlcv.open:
-                order.price = ohlcv.open
-                return True
-            elif not long and price > ohlcv.open:
-                order.price = ohlcv.open
-                return True
-        return False
+    def make_orders(self) -> None:
+        tp_price = self.signal.close * (1 + self.tp_pct) if self.long else self.signal.close * (1 - self.tp_pct)
+        sl_price = self.signal.close * (1 - self.sl_pct) if self.long else self.signal.close * (1 + self.sl_pct)
 
-    def order_filled(self, order: Order) -> None:
-        if order.type == 'tp':
-            adjust_amount = order.amount * (self.remain_portion/self.tp_remain)
-            self.exit_price += order.price * adjust_amount
-            self.tp_remain -= order.amount
-        else:
-            adjust_amount = order.amount * (self.remain_portion/self.sl_remain)
-            self.exit_price += order.price * (adjust_amount)
-            self.sl_remain -= order.amount
-        
-        self.remain_portion -= adjust_amount
+        self.orders.append(
+            Order(
+                price=sl_price,
+                amount=1,
+                type='sl'
+            )
+        )
+        self.orders.append(
+            Order(
+                price=tp_price,
+                amount=1,
+                type='tp'
+            )
+        )
 
 class SignalGeneratorBase:
     SIGNAL_TYPE: Literal['long', 'short']
@@ -190,11 +223,14 @@ class SignalGeneratorBase:
                 m *= 30 * 24 * 60
         return m
 
-    def check_upper_timeframe_trend(self, signal_row: SignalRow, upper_data: pd.DataFrame) -> bool:
+    def check_upper_timeframe_trend(self, signal_row: SignalRow | pd.Timestamp, upper_data: pd.DataFrame) -> bool:
         data = upper_data[upper_data.index <= signal_row[0]]
         if data.index[-1] == signal_row[0]:
             data = data.iloc[:-1]
-        return data.trend[-1] < signal_row[1]['close'] if self.signal_type == 'long' else data.trend[-1] > signal_row[1]['close']
+        try:
+            return data.trend[-1] < signal_row[1]['close'] if self.signal_type == 'long' else data.trend[-1] > signal_row[1]['close']
+        except Exception:
+            return False
 
     def is_above(self) -> bool:
         return self.signal_type == 'long'
@@ -330,7 +366,7 @@ class SignalGeneratorBase:
         )
         analysis_quality = self.recalculate_analysis_quality(train, raw_signal_len)
         long = self.is_above()
-        for timestamp, signal in test.iterrows():
+        for timestamp, signal in tqdm(test.iterrows(), total=len(test), unit='signal', desc='Evaluating...'):
 
             # update analysis quality
             for ptimestamp, psignal in pending_signal_quality.items():
