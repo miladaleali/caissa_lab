@@ -22,15 +22,32 @@ def get_data_provider() -> Exchange:
         }
     return okx(config=configs)
 
+def timeframe_to_minute(timeframe: str) -> int:
+    m, t = timeframe[:-1], timeframe[-1]
+    match t:
+        case 'm':
+            m *= 1
+        case 'h':
+            m *= 60
+        case 'd':
+            m *= 24 * 60
+        case 'w':
+            m *= 7 * 24 * 60
+        case 'M':
+            m *= 360 * 24 * 60
+    return int(m)
+
 def chunk_fetch_period(
     start: int,
     end: int,
-    limit: int = 100
+    timeframe: str = '1m',
+    limit: int = 100,
 ) -> list[int]:
     """
     return only since timestamp
     """
-    step = limit * 60 * 1000
+    t2m = timeframe_to_minute(timeframe)
+    step = limit * t2m * 60 * 1000
     tmp_end = start + step
     periods = []
     while tmp_end < end:
@@ -93,11 +110,11 @@ async def fetch_data(
     fname = f'{symbol}_{timeframe}_since_{start}_till_{_end}'
     start = safe_input_datetime(start)
 
-    sinces = chunk_fetch_period(start, end, limit=limit)
+    sinces = chunk_fetch_period(start, end, limit=limit, timeframe=timeframe)
     sinces = list(chunkit(sinces, api_limit[0]))
 
     datas = []
-    for _sinces in tqdm(sinces, total=len(sinces), unit='batch', desc='Downloading OHLCV...'):
+    for _sinces in tqdm(sinces, total=len(sinces), unit='batch', desc=f'Downloading {symbol} OHLCV...'):
         _tmp = await asyncio.gather(*[_fetch_ohlcv(data_provider=data_provider, symbol=symbol, timeframe=timeframe, since=since, limit=limit) for since in _sinces])
         _tmp = [d for sub_d in _tmp for d in sub_d]
         datas.extend(_tmp)
